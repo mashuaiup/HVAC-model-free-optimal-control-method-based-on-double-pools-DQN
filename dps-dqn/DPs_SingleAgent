@@ -1,0 +1,346 @@
+'''
+Author:Shuai Ma
+Time:2021/4/1
+'''
+import random
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import model
+import math
+import xlwt
+reward_shaping  = True
+showFigures     = True
+printDetails    = True
+ALPHA           = 0.01
+
+ALPHA_ratio     = 0.01
+
+GAMMA           = 0.01
+BATCH_SIZE      = 32
+BATCH_SIZE_RATIO = 32
+TARGET_UPDATE   = 200
+MEMORY_CAPACITY_artio = 600
+MEMORY_CAPACITY = 2000
+EPS             = 1
+EPS_Ratio       = 1
+EPS_MIN         = 0.01
+EPS_DECAY       = 0.0001
+EPS_DECAY_ratio = 0.0007
+LearnStep = 0
+episodes        = 20
+cap_small_chiller = 1760
+cap_big_chiller = 2810
+PLR_small = 0.4
+PLR_big = 1
+############################# Setup the problem #############################
+env = model.model()
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+############################# Neural Net class #############################
+class Net(nn.Module):
+    def __init__(self,STATE_SIZE,ACTION_SIZE):
+        super(Net, self).__init__()
+        self.fc1 = nn.Linear(STATE_SIZE, 32)
+        self.fc2 = nn.Linear(32, ACTION_SIZE)
+    def forward(self, x):
+        x = F.relu(self.fc1(x))
+        return self.fc2(x)
+class agent_Ratio:
+    def __init__(self,STATE_SIZE,ACTION_SIZE,action_space_array):
+        self.num_of_pumpandtower = 676
+        self.STATE_SIZE = STATE_SIZE
+        self.ACTION_SIZE = ACTION_SIZE
+        self.action_space = action_space_array
+        self.policy_net = Net(STATE_SIZE,ACTION_SIZE).to(device)
+        self.target_net = Net(STATE_SIZE,ACTION_SIZE).to(device)
+        self.target_net.load_state_dict(self.policy_net.state_dict())
+        self.target_net.eval()
+        self.learn_counter = 0
+        self.mem_counter = 0
+        self.mem_counter_ratio = 0
+        self.memory = np.zeros((MEMORY_CAPACITY, STATE_SIZE * 2 + 2))
+        self.memory_ratio = np.zeros((MEMORY_CAPACITY_artio, STATE_SIZE * 2 + 2))
+        self.optimizer = torch.optim.Adam(self.policy_net.parameters(), lr=ALPHA_ratio)
+        self.loss_func = nn.MSELoss()
+        self.success_counter = 0
+        self.isSuccess = False
+        self.isStartedLearning = True
+        self.listScore = []
+    def select_action(self, state,flag_whether_need_ratio):#
+        '''
+        实验记录  7028这个数据在步长=0.1的离散ratio空间里面找不到合理的ratio
+        '''
+        rand_num = random.random()
+        global EPS_Ratio
+        global EPS_DECAY_ratio
+        EPS_Ratio = EPS_Ratio - EPS_DECAY_ratio
+        if EPS_Ratio >= EPS_MIN:
+            EPS_Ratio = EPS_Ratio
+        else:
+            EPS_Ratio = EPS_MIN
+        if rand_num > EPS_Ratio:
+            if flag_whether_need_ratio==False:
+                state = torch.unsqueeze(torch.FloatTensor(state), 0).to(device)
+                list = self.policy_net.forward(state)
+                index = torch.argmax(list[0][0:676])
+                return index
+            else:
+                state = torch.unsqueeze(torch.FloatTensor(state), 0).to(device)
+                list = self.policy_net.forward(state)
+                ratio_min_big = (cap_big_chiller * PLR_small) / state[0][0]
+                ratio_min_small = (state[0][0] - (cap_small_chiller * PLR_big)) / state[0][0]
+                ratio_min = max(ratio_min_small, ratio_min_big)
+                ratio_big_samll = (state[0][0] - (cap_small_chiller * PLR_small)) / state[0][0]
+                ratio_big_big = (cap_big_chiller * PLR_big) / state[0][0]
+                ratio_max = min(ratio_big_big, ratio_big_samll)
+
+                ratio_index_start = math.ceil(ratio_min*10) - 1
+                ratio_index_start = self.num_of_pumpandtower * ratio_index_start
+
+                ratio_index_end = math.floor(ratio_max*10)
+                ratio_index_end = self.num_of_pumpandtower * ratio_index_end
+
+                if state[0][0] > 2810 * 2:
+                    ratio_min_big = ((cap_big_chiller * PLR_small) + (cap_big_chiller * PLR_small)) / state[0][0]
+                    ratio_min_small = (state[0][0] - (cap_small_chiller * PLR_big)) / state[0][0]
+                    ratio_min = max(ratio_min_small, ratio_min_big)
+                    ratio_big_samll = (state[0][0] - (cap_small_chiller * PLR_small)) / state[0][0]
+                    ratio_big_big = (cap_big_chiller * PLR_big + cap_big_chiller * PLR_big) / state[0][0]
+                    ratio_max = min(ratio_big_big, ratio_big_samll)
+
+                    ratio_index_start = math.ceil(ratio_min * 10) - 1
+                    ratio_index_start = self.num_of_pumpandtower * ratio_index_start
+                    ratio_index_end = math.floor(ratio_max * 10)
+                    ratio_index_end = self.num_of_pumpandtower * ratio_index_end
+                    if ratio_max-ratio_min<0.1:
+                        ratio_index_start = ratio_index_end-self.num_of_pumpandtower
+                index_ = torch.argmax(list[0][ratio_index_start:ratio_index_end])
+                return ratio_index_start+index_
+        else:
+            if flag_whether_need_ratio == False:
+                return torch.tensor([[random.randrange(0,676)]], device=device, dtype=torch.long).item()
+            else:
+                state = torch.unsqueeze(torch.FloatTensor(state), 0).to(device)
+                ratio_min_big = (cap_big_chiller * PLR_small) / state[0][0]
+                ratio_min_small = (state[0][0] - (cap_small_chiller * PLR_big)) / state[0][0]
+                ratio_min = max(ratio_min_small, ratio_min_big)
+                ratio_big_samll = (state[0][0] - (cap_small_chiller * PLR_small)) / state[0][0]
+                ratio_big_big = (cap_big_chiller * PLR_big) / state[0][0]
+                ratio_max = min(ratio_big_big, ratio_big_samll)
+                ratio_min_index = math.ceil(ratio_min * 10)
+                ratio_min_index = self.num_of_pumpandtower * ratio_min_index
+                ratio_max_index = math.floor(ratio_max*10)
+                ratio_max_index = ratio_max_index * self.num_of_pumpandtower
+                if state[0][0] > 2810 * 2:
+                    ratio_min_big = ((cap_big_chiller * PLR_small) + (cap_big_chiller * PLR_small)) / state[0][0]
+                    ratio_min_small = (state[0][0] - (cap_small_chiller * PLR_big)) / state[0][0]
+                    ratio_min = max(ratio_min_small, ratio_min_big)
+                    ratio_big_samll = (state[0][0] - (cap_small_chiller * PLR_small)) / state[0][0]
+                    ratio_big_big = (cap_big_chiller * PLR_big + cap_big_chiller * PLR_big) / state[0][0]
+                    ratio_max = min(ratio_big_big, ratio_big_samll)
+
+                    ratio_min_index = math.ceil(ratio_min * 10)
+                    ratio_min_index = ratio_min_index *self.num_of_pumpandtower
+                    ratio_max_index = math.floor(ratio_max * 10)
+                    ratio_max_index = ratio_max_index * self.num_of_pumpandtower
+                if ratio_max-ratio_min<0.1 or ratio_max_index==ratio_min_index:
+                    ratio_min_index = ratio_max_index - self.num_of_pumpandtower
+                return torch.tensor([[random.randrange(ratio_min_index,ratio_max_index)]], device=device, dtype=torch.long).item()
+    def store_transition(self, s, a, r, s1,flag_if_need_ratio):
+        transition = np.hstack((s, [a, r], s1))
+        if flag_if_need_ratio:
+            index_ratio = self.mem_counter_ratio % MEMORY_CAPACITY_artio
+            self.memory_ratio[index_ratio,:] = transition
+            self.mem_counter_ratio += 1
+        else:
+            index = self.mem_counter % MEMORY_CAPACITY
+            self.memory[index, :] = transition
+            self.mem_counter += 1
+    def learn(self):
+        if self.learn_counter % TARGET_UPDATE == 0:
+            self.target_net.load_state_dict(self.policy_net.state_dict())
+        self.learn_counter += 1
+        sample_index_ratio = np.random.choice(min(self.mem_counter_ratio, MEMORY_CAPACITY_artio), BATCH_SIZE_RATIO)
+        batch_ratio_memory = self.memory_ratio[sample_index_ratio,:]
+
+        sample_index = np.random.choice(min(self.mem_counter,MEMORY_CAPACITY), BATCH_SIZE)
+        b_memory_= self.memory[sample_index, :]
+        b_memory = np.concatenate((b_memory_,batch_ratio_memory))
+        b_s  = torch.FloatTensor(b_memory[:, :self.STATE_SIZE]).to(device)
+        b_a  = torch.LongTensor(b_memory[:, self.STATE_SIZE:self.STATE_SIZE+1].astype(int)).to(device)
+        b_r  = torch.FloatTensor(b_memory[:, self.STATE_SIZE+1:self.STATE_SIZE+2]).to(device)
+        b_s1 = torch.FloatTensor(b_memory[:, -self.STATE_SIZE:]).to(device)
+        Q      = self.policy_net(b_s).gather(1, b_a)
+        Q1     = self.target_net(b_s1).detach()
+        target = b_r + GAMMA * Q1.max(1)[0].view(BATCH_SIZE+BATCH_SIZE_RATIO, 1)
+        loss   = self.loss_func(Q,target)
+        self.optimizer.zero_grad()
+        loss.backward()
+        self.optimizer.step()
+        return loss
+class marco:
+    def __init__(self):
+        self.CCbig = 2810
+        self.CCsmall = 1760
+        self.action = np.load("action_all_6760.npy")
+    def train(self):
+        Agent = agent_Ratio(2,6760,self.action)
+        R_list = []
+        num = 0
+        for episode in range(episodes):
+            s = env.reset()
+            R = 0
+            step = 0
+            row = 0
+            row_loss = 0
+            book = xlwt.Workbook()
+            loss_sheet = book.add_sheet('loss', cell_overwrite_ok=True)
+            CLs_data_sheet = book.add_sheet('CLs'+str(episode), cell_overwrite_ok=True)
+            ratio_sheet = book.add_sheet('ratio'+str(episode), cell_overwrite_ok=True)
+            r_sheet = book.add_sheet('r'+str(episode), cell_overwrite_ok=True)
+            P_big_challer_two_sheet = book.add_sheet('P_big_challer_two'+str(episode), cell_overwrite_ok=True)
+            P_big_tower_two_sheet = book.add_sheet('P_big_tower_two'+str(episode), cell_overwrite_ok=True)
+            P_big_pump_two_sheet = book.add_sheet('P_big_pump_two'+str(episode), cell_overwrite_ok=True)
+
+            P_small_challer_sheet = book.add_sheet('P_small_challer'+str(episode), cell_overwrite_ok=True)
+            P_small_tower_sheet = book.add_sheet('P_small_tower'+str(episode), cell_overwrite_ok=True)
+            P_small_pump_sheet = book.add_sheet('P_small_pump'+str(episode), cell_overwrite_ok=True)
+
+            f_big_pump_sheet = book.add_sheet('f_big_pump' + str(episode), cell_overwrite_ok=True)
+            f_big_tower_sheet = book.add_sheet('f_big_tower' + str(episode), cell_overwrite_ok=True)
+            f_small_pump_sheet = book.add_sheet('f_small_pump' + str(episode), cell_overwrite_ok=True)
+            f_small_tower_sheet = book.add_sheet('f_small_tower' + str(episode), cell_overwrite_ok=True)
+
+            Tcwr_big_sheet = book.add_sheet('Tcwr_big' + str(episode), cell_overwrite_ok=True)
+            Tcwr_small_sheet = book.add_sheet('Tcwr_samll' + str(episode), cell_overwrite_ok=True)
+
+            Tcws_big_sheet = book.add_sheet('Tcws_big' + str(episode), cell_overwrite_ok=True)
+            Tcws_small_sheet = book.add_sheet('Tcws_samll' + str(episode), cell_overwrite_ok=True)
+
+            on_off_sheet = book.add_sheet('on_off'+str(episode), cell_overwrite_ok=True)
+            while True:
+                global LearnStep
+                LearnStep += 1
+                flag_store = False
+                flag_big_pump_tower = False
+                flag_small_pump_tower = False
+                flag_whether_need_ratio = False
+                step += 1
+                on_off = [1,1,1]
+                CLs = s[0]
+                if CLs<= self.CCbig:
+                    if CLs <= self.CCsmall:
+                        if CLs <= 0.4 * self.CCsmall:
+                            on_off = [0, 0, 0]
+                            ratio = 0
+                            f_big_pump = 0
+                            f_big_tower = 0
+                            f_small_pump = 0
+                            f_small_tower = 0
+                        else:
+                            on_off = [0, 0, 1]
+                            ratio = 0
+                            f_big_pump = 0
+                            f_big_tower = 0
+                            action_index = Agent.select_action(s,flag_whether_need_ratio)
+                            f_small_pump = self.action[action_index][1]
+                            f_small_tower = self.action[action_index][2]
+                            flag_small_pump_tower = True
+                    else:
+                        on_off = [1, 0, 0]
+                        ratio = 1
+                        action_index = Agent.select_action(s,flag_whether_need_ratio)
+                        f_big_pump = self.action[action_index][1]
+                        f_big_tower = self.action[action_index][2]
+                        f_small_pump = 0
+                        f_small_tower = 0
+                        flag_big_pump_tower = True
+                else:
+                    if CLs<=self.CCbig+self.CCsmall:
+                        on_off = [1, 0, 1]
+                        flag_whether_need_ratio = True
+                        action_index = Agent.select_action(s,flag_whether_need_ratio)
+                        ratio = self.action[action_index][0]
+                        f_big_pump = self.action[action_index][1]
+                        f_big_tower = self.action[action_index][2]
+                        f_small_pump = f_big_pump
+                        f_small_tower = f_big_tower
+                        flag_store = True
+                        flag_big_pump_tower = True
+                        flag_small_pump_tower = True
+                    else:
+                        if CLs<=2*self.CCbig:
+                            on_off = [1, 1, 0]
+                            ratio = 1
+                            action_index = Agent.select_action(s,flag_whether_need_ratio)
+                            f_big_pump = self.action[action_index][1]
+                            f_big_tower = self.action[action_index][2]
+                            f_small_pump = 0
+                            f_small_tower = 0
+                            flag_big_pump_tower = True
+                        else:
+                            on_off = [1, 1, 1]
+                            flag_whether_need_ratio = True
+                            action_index = Agent.select_action(s,flag_whether_need_ratio)
+                            ratio = self.action[action_index][0]
+                            f_big_pump = self.action[action_index][1]
+                            f_big_tower = self.action[action_index][2]
+                            f_small_pump = f_big_pump
+                            f_small_tower = f_big_tower
+                            flag_store = True
+                            flag_big_pump_tower = True
+                            flag_small_pump_tower = True
+                s_,r,done,P_big_challer_two,P_big_tower_two,P_big_pump_two,P_small_challer,P_small_tower,P_small_pump,Tcwr_big,Tcwr_small,Tcws_big,Tcws_small= env.step([ratio, f_big_pump, f_big_tower, f_small_pump, f_small_tower,on_off])
+                #记录数据
+                CLs_data_sheet.write(row, 0, str(CLs))
+                ratio_sheet.write(row, 0, str(ratio))
+                r_sheet.write(row, 0, str(r))
+                P_big_challer_two_sheet.write(row, 0, str(P_big_challer_two))
+                P_big_tower_two_sheet.write(row, 0, str(P_big_tower_two))
+                P_big_pump_two_sheet.write(row, 0, str(P_big_pump_two))
+
+                P_small_challer_sheet.write(row, 0, str(P_small_challer))
+                P_small_tower_sheet.write(row, 0, str(P_small_tower))
+                P_small_pump_sheet.write(row, 0, str(P_small_pump))
+
+                f_big_pump_sheet.write(row, 0, str(f_big_pump))
+                f_big_tower_sheet.write(row, 0, str(f_big_tower))
+                f_small_pump_sheet.write(row, 0, str(f_small_pump))
+                f_small_tower_sheet.write(row, 0, str(f_small_tower))
+
+                Tcwr_big_sheet.write(row, 0, str(Tcwr_big))
+                Tcwr_small_sheet.write(row, 0, str(Tcwr_small))
+
+                Tcws_big_sheet.write(row, 0, str(Tcws_big))
+                Tcws_small_sheet.write(row, 0, str(Tcws_small))
+
+                on_off_sheet.write(row, 0, str(on_off[0]))
+                on_off_sheet.write(row, 1, str(on_off[1]))
+                on_off_sheet.write(row, 2, str(on_off[2]))
+                if flag_big_pump_tower:
+                    Agent.store_transition(s, action_index, r, s_,flag_whether_need_ratio)
+
+                if flag_small_pump_tower:
+                    Agent.store_transition(s, action_index, r, s_,flag_whether_need_ratio)
+                if flag_store:
+                    R += r
+                    Agent.store_transition(s, action_index, r, s_,flag_whether_need_ratio)
+                if Agent.mem_counter > BATCH_SIZE:
+                    loss = Agent.learn()
+                    loss_sheet.write(row_loss, 0, str(loss.item()))
+                    row_loss += 1
+                row += 1
+                book.save("./25_50_dps/SingalAgent_control_data"+str(episode)+"_optimal_5"+ '.xls')
+                if done:
+                    print("Epi:",episode,"Reward:",R,"EPS_Ratio",EPS_Ratio)
+                    R_list.append(R)
+                    R_list.append(EPS)
+                    break
+                s = s_
+        R_list = np.array(R_list)
+        np.save("R_list5.npy",R_list)
+if __name__ == "__main__":
+    marco = marco()
+    marco.train()
